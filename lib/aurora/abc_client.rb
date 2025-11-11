@@ -2,6 +2,7 @@
 
 require "yaml"
 require "uri"
+require "set"
 
 require "aurora/aux_heat"
 require "aurora/blower"
@@ -142,7 +143,9 @@ module Aurora
                 :air_coil_temperature,
                 :line_voltage,
                 :line_voltage_setting,
-                :watts
+                :watts,
+                :extra_registers,
+                :extra_register_results
 
     alias_method :emergency_shutdown?, :emergency_shutdown
     alias_method :load_shed?, :load_shed
@@ -150,7 +153,7 @@ module Aurora
     alias_method :derated?, :derated
     alias_method :safe_mode?, :safe_mode
 
-    def initialize(uri)
+    def initialize(uri, extra_registers: [])
       @modbus_slave = self.class.open_modbus_slave(uri)
       @modbus_slave.read_retry_timeout = 15
       @modbus_slave.read_retries = 2
@@ -213,6 +216,8 @@ module Aurora
       end
       # need dehumidify mode to calculate final current mode
       @registers_to_read.push(362) if compressor.is_a?(Compressor::VSDrive)
+      @extra_registers = normalize_extra_registers(extra_registers)
+      @extra_register_results = {}
     end
 
     def query_registers(query)
@@ -275,6 +280,21 @@ module Aurora
       end
       @components.each do |component|
         component.refresh(registers)
+      end
+
+      @extra_register_results = {}
+      @extra_registers.each do |extra|
+        begin
+          raw_result = @modbus_slave.read_multiple_holding_registers(extra[:range])
+          raw = raw_result.each_with_object({}) { |(k, v), acc| acc[k] = v }
+          transformed = Aurora.transform_registers(raw.dup)
+          @extra_register_results[extra[:id]] = {
+            value: format_extra_register_value(transformed),
+            raw: raw.length == 1 ? raw.values.first : raw
+          }
+        rescue => e
+          @extra_register_results[extra[:id]] = { error: e.message }
+        end
       end
     end
 
@@ -390,6 +410,71 @@ module Aurora
       "#<Aurora::ABCClient #{(instance_variables - [:@modbus_slave]).map do |iv|
                                "#{iv}=#{instance_variable_get(iv).inspect}"
                              end.join(", ")}>"
+    end
+
+    private
+
+    def normalize_extra_registers(extra_registers)
+      return [] if extra_registers.nil? || extra_registers.empty?
+
+      seen_ids = Set.new
+      Array(extra_registers).each_with_object([]) do |entry, acc|
+        next if entry.nil?
+
+        entry = entry.transform_keys { |k| k.respond_to?(:to_sym) ? k.to_sym : k } if entry.respond_to?(:transform_keys)
+        register = entry[:register] || entry["register"]
+        raise ArgumentError, "extra register entries must include a register" if register.nil?
+
+        register = Integer(register)
+        length = entry[:length] || entry["length"] || 1
+        length = Integer(length)
+        raise ArgumentError, "length must be greater than zero" unless length.positive?
+
+        range = register..(register + length - 1)
+        name = entry[:name] || entry["name"] || Aurora::REGISTER_NAMES[register] || "Register #{register}"
+        id_source = entry[:id] || entry["id"] || name || "register-#{register}"
+        id = sanitize_property_id(id_source)
+        original_id = id
+        suffix = 2
+        while seen_ids.include?(id)
+          id = "#{original_id}-#{suffix}"
+          suffix += 1
+        end
+        seen_ids << id
+
+        acc << { register: register, length: length, range: range, name: name, id: id }
+      end
+    end
+
+    def sanitize_property_id(value)
+      id = value.to_s.downcase.gsub(/[^a-z0-9]+/, "-").gsub(/^-|-$/, "")
+      id = "register-#{value}" if id.empty?
+      id
+    end
+
+    def format_extra_register_value(registers)
+      return "" if registers.empty?
+
+      if registers.length == 1
+        stringify_extra_value(registers.values.first)
+      else
+        registers.map do |register, value|
+          "#{register}: #{stringify_extra_value(value)}"
+        end.join(", ")
+      end
+    end
+
+    def stringify_extra_value(value)
+      case value
+      when Array
+        value.map { |v| stringify_extra_value(v) }.join(", ")
+      when Hash
+        value.map { |k, v| "#{k}=#{stringify_extra_value(v)}" }.join(", ")
+      when nil
+        ""
+      else
+        value.to_s
+      end
     end
   end
 end

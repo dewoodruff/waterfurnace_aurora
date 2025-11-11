@@ -239,6 +239,27 @@ plethora of other diagnostic information will be published to MQTT regularly.
 Several properties such as set point and current mode can also be written
 back to the ABC via MQTT.
 
+You can publish additional holding registers by providing a YAML configuration
+file. Pass the file path with `--config` when launching the bridge and include
+the registers you want to monitor:
+
+```yaml
+registers:
+  - register: 813
+    name: "IntelliZone 2 Version"
+  - register: 3424
+    length: 2
+    name: "VS Drive Supply Voltage"
+    id: vs-drive-supply
+```
+
+Each entry requires a `register` number and can optionally declare `length`
+(defaults to 1), a display `name`, and a Homie property `id`. When omitted, the
+bridge derives the name from the built-in register catalog and the property id
+from the name. Values are exposed beneath an `extra-registers` node as string
+diagnostic sensors in both MQTT and Home Assistant. Any read errors are
+surfaced on the corresponding property.
+
 You can also host the web AID tool directly from the MQTT bridge by giving
 it a port to listen on:
 `APP_ENV=production aurora_mqtt_bridge /dev/ttyUSB0 mqtt://localhost/ --web-aid-tool=4567`
