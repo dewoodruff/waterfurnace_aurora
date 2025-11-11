@@ -12,6 +12,42 @@ require "aurora/core_ext/string"
 debug_modbus = false
 web_aid_tool = nil
 device_name = "WaterFurnace"
+config_file = nil
+
+def load_extra_registers(path)
+  data = YAML.safe_load(File.read(path), aliases: false)
+  registers = case data
+              when Array
+                data
+              when Hash
+                data["registers"] ||
+                  data[:registers] ||
+                  data["extra_registers"] ||
+                  data[:extra_registers] ||
+                  []
+              when nil
+                []
+              else
+                raise OptionParser::InvalidArgument,
+                      "configuration must be an array or hash containing a registers key"
+              end
+
+  registers = [] if registers.nil?
+  unless registers.is_a?(Array)
+    raise OptionParser::InvalidArgument, "register definitions must be provided as an array"
+  end
+
+  registers
+rescue Errno::ENOENT => e
+  warn "unable to read configuration file: #{e.message}"
+  exit 1
+rescue Psych::SyntaxError => e
+  warn "unable to parse configuration file: #{e.message}"
+  exit 1
+rescue OptionParser::InvalidArgument => e
+  warn e.message
+  exit 1
+end
 
 options = OptionParser.new do |opts|
   opts.banner = "Usage: aurora_mqtt_bridge /path/to/serial/port mqtt://uri/ [options]"
@@ -19,6 +55,7 @@ options = OptionParser.new do |opts|
   opts.on("--device-name DEVICENAME", "Give a descriptive name to your device") { |v| device_name = v }
   opts.on("--debug-modbus", "Print actual protocol bytes") { debug_modbus = true }
   opts.on("--web-aid-tool PORT", "Run web aid tool on given port", Integer) { |v| web_aid_tool = v }
+  opts.on("--config FILE", "Load additional register definitions from FILE") { |v| config_file = v }
   opts.on("-v", "--version", "Print version") do
     puts Aurora::VERSION
     exit
@@ -37,8 +74,17 @@ unless ARGV.length == 2
 end
 
 mqtt_uri = ARGV[1]
+extra_registers = config_file ? load_extra_registers(config_file) : []
 
-abc = Aurora::ABCClient.new(ARGV[0])
+abc = begin
+  Aurora::ABCClient.new(ARGV[0], extra_registers: extra_registers)
+rescue ArgumentError => e
+  if e.message =~ /register/i || e.message.include?("length")
+    warn "invalid extra register configuration: #{e.message}"
+    exit 1
+  end
+  raise
+end
 Aurora.logger = abc.modbus_slave.logger = Logger.new($stdout)
 Aurora.logger.level = debug_modbus ? :debug : :info
 
@@ -49,6 +95,7 @@ class MQTTBridge
     @abc = abc
     @homie = homie
     @mutex = Mutex.new
+    @extra_register_properties = nil
 
     @homie.out_of_band_topic_proc = lambda do |topic, value|
       @mutex.synchronize do
@@ -124,6 +171,11 @@ class MQTTBridge
               next if fault_count == 0xffff
 
               @faults["e#{i + 1}"].value = fault_count
+            end
+            if @extra_register_properties
+              @extra_register_properties.each do |id, property|
+                property.value = extra_register_value(id)
+              end
             end
           end
         end
@@ -735,6 +787,20 @@ class MQTTBridge
       end
     end
 
+    if @abc.extra_registers.any?
+      @extra_register_properties = {}
+      @homie.node("extra-registers", "Extra Registers", "Diagnostics") do |node|
+        @abc.extra_registers.each do |extra|
+          property = node.property(extra[:id],
+                                   extra[:name],
+                                   :string,
+                                   extra_register_value(extra[:id]),
+                                   hass: { sensor: { entity_category: :diagnostic } })
+          @extra_register_properties[extra[:id]] = property
+        end
+      end
+    end
+
     @abc.zones.each_with_index do |zone, i|
       type = zone.is_a?(Aurora::IZ2Zone) ? "IntelliZone 2 Zone" : "Thermostat"
       @homie.node("zone#{i + 1}", "Zone #{i + 1}", type) do |node|
@@ -847,6 +913,20 @@ class MQTTBridge
                           JINJA
                          )
       end
+    end
+
+    private
+
+    def extra_register_value(id)
+      result = @abc.extra_register_results[id]
+      return if result.nil?
+
+      value = result[:value]
+      return value unless value.nil?
+
+      return "error: #{result[:error]}" if result[:error]
+
+      nil
     end
 
     # direct access to modbus registers for debugging purposes
