@@ -1,12 +1,11 @@
 name: Docker Image CI
 
 on:
-  schedule:
-    - cron: '33 2 */14 * *'
   push:
     branches: [ main ]
     tags:
       - 'v*'
+  workflow_dispatch: {}
   pull_request:
     branches: [ main ]
     
@@ -23,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
       
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v5
     
     - name: Log into registry ${{ env.REGISTRY }}
       if: github.event_name != 'pull_request'
@@ -55,7 +54,7 @@ jobs:
           latest=true
         
     - name: Build and push
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v6
       with:
         context: ./docker
         push: ${{ github.event_name != 'pull_request' }}
